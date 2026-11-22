@@ -3,11 +3,22 @@ changing it changes the goalposts."""
 
 from __future__ import annotations
 
-from typing import AsyncIterator, Literal, Protocol
+from typing import AsyncIterator, Literal, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
 Severity = Literal["trivial", "low", "medium", "high", "critical"]
+
+# A free string let a real model answer "authentication" where the golden set
+# says "auth": right answer, wrong word. As a Literal the list reaches the model
+# as a JSON-schema enum, so it picks rather than invents, and a word outside it
+# fails validation -- a permanent error, since a retry would get the same word.
+# COMPONENTS is read off the type so the two can never drift apart.
+Component = Literal[
+    "auth", "payments", "database", "api", "ui",
+    "search", "notifications", "storage", "unknown",
+]
+COMPONENTS: tuple[str, ...] = get_args(Component)
 
 
 class TriageResult(BaseModel):
@@ -17,7 +28,7 @@ class TriageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     severity: Severity
-    component: str
+    component: Component
     duplicate_of: str | None = None
     steps: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
@@ -44,6 +55,14 @@ class StreamEvent(BaseModel):
     # read as transient, so an adapter that forgets to say keeps the old,
     # cautious behaviour rather than silently disabling the breaker.
     transient: bool | None = None
+    # Token usage, on the terminal event of a stream that ran to completion --
+    # `done`, or an `error` for output that came back but would not validate,
+    # since that was billed too. The ledger settles from these; their absence
+    # means the cost is unknown and the reservation is released instead. They
+    # ride on the event because only the adapter sees the vendor's usage, and
+    # exclude=True keeps them off the SSE wire: billing is not the client's API.
+    input_tokens: int | None = Field(default=None, exclude=True)
+    output_tokens: int | None = Field(default=None, exclude=True)
 
 
 class TriageRequest(BaseModel):

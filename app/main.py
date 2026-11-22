@@ -7,7 +7,8 @@ service, including translating each failure mode into the status code that
 tells the caller what to do about it:
 
     503 + Retry-After   breaker open, or retries exhausted -- come back later
-    402                 spend ceiling -- a human must raise the limit
+                        (on every configured provider, when there is a fallback)
+    402                 spend ceiling -- a human must raise the limit, streams included
     422                 the model's output did not validate -- do not retry
     504                 upstream stalled past REQUEST_TIMEOUT_S
 """
@@ -126,6 +127,9 @@ async def limits(request: Request) -> dict:
         "max_retries": service.policy.max_retries,
         "breaker_state": service.breaker.state,
         "breaker_consecutive_failures": service.breaker.consecutive_failures,
+        "fallback_breaker_state": (
+            None if service.fallback_breaker is None else service.fallback_breaker.state
+        ),
     }
 
 
@@ -208,9 +212,13 @@ async def triage_stream(request: Request, body: TriageRequest):
     stream ends in `error` -- never a partial object dressed up as an answer.
     """
     service = get_service(request)
+    stream = service.triage_stream(body.text)
 
+    # Pull the first event before committing to a 200. Everything that can
+    # refuse the request -- breaker, spend ceiling -- raises from this first
+    # step, while there is still a status code to send.
     try:
-        await service.breaker.before_call()
+        first = await anext(stream)
     except CircuitOpenError as exc:
         return _error(
             503,
@@ -218,15 +226,30 @@ async def triage_stream(request: Request, body: TriageRequest):
             str(exc),
             headers={"retry-after": str(int(max(1, exc.retry_after)))},
         )
+    except SpendCeilingExceeded as exc:
+        return _error(402, "spend_ceiling_exceeded", str(exc))
+    except PermanentProviderError as exc:
+        return _error(422, "invalid_provider_output", str(exc))
+    except TransientProviderError as exc:
+        return _error(503, "upstream_unavailable", str(exc), headers={"retry-after": "1"})
+
+    def sse(event) -> bytes:
+        payload = json.loads(event.model_dump_json(exclude_none=True))
+        return f"event: {event.type}\ndata: {json.dumps(payload)}\n\n".encode()
 
     async def body_iter():
         try:
-            async for event in service.triage_stream(body.text):
-                payload = json.loads(event.model_dump_json(exclude_none=True))
-                yield f"event: {event.type}\ndata: {json.dumps(payload)}\n\n".encode()
+            yield sse(first)
+            async for event in stream:
+                yield sse(event)
         except Exception as exc:  # a failure after headers went out
             payload = {"type": "error", "error": str(exc)}
             yield f"event: error\ndata: {json.dumps(payload)}\n\n".encode()
+        finally:
+            # A client that disconnects closes this generator, not the inner
+            # one; without this the permit and the reservation it holds would
+            # wait for the garbage collector.
+            await stream.aclose()
 
     return StreamingResponse(
         body_iter(),

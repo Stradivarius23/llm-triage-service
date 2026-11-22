@@ -8,7 +8,7 @@ run actually configured to do?" by printing `get_settings()`.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -89,6 +89,19 @@ class Settings:
     openai_api_key: str = field(default_factory=lambda: _str("OPENAI_API_KEY", "not-a-real-key"))
     model: str = field(default_factory=lambda: _str("MODEL", "claude-haiku-4-5"))
     temperature: float = field(default_factory=lambda: _float("TEMPERATURE", 0.0))
+
+    # --- fallback provider ------------------------------------------------
+    # The dialect that answers when PROVIDER is down; empty means none. It
+    # needs its own model and base URL as soon as it leaves the mock: an
+    # Anthropic model name means nothing to OpenAI, and the two vendors live on
+    # different hosts. Unset, both inherit the primary's, which is right for the
+    # mock -- it speaks both dialects on one port. FALLBACK_BASE_URL follows
+    # PROVIDER_BASE_URL's rule: set-but-empty means the SDK default, the real API.
+    fallback_provider: str = field(default_factory=lambda: _str("FALLBACK_PROVIDER", ""))
+    fallback_model: str = field(default_factory=lambda: _str("FALLBACK_MODEL", ""))
+    fallback_base_url: str | None = field(
+        default_factory=lambda: os.environ.get("FALLBACK_BASE_URL")
+    )
     max_tokens: int = field(default_factory=lambda: _int("MAX_TOKENS", 1024))
 
     # --- reliability ------------------------------------------------------
@@ -139,6 +152,11 @@ class Settings:
                 "It names the dialect, not a Python class; PROVIDER_BASE_URL still "
                 "chooses the transport."
             )
+        if self.fallback_provider and self.fallback_provider not in PROVIDERS:
+            raise ValueError(
+                f"FALLBACK_PROVIDER must be one of {sorted(PROVIDERS)} or empty, "
+                f"got {self.fallback_provider!r}"
+            )
         if self.targets_real_api and not self.allow_real_api:
             # A base URL is a legitimate configuration — it is how the mock is
             # reached. What needs confirming is real, billable traffic, so the
@@ -150,6 +168,26 @@ class Settings:
                 "workshop requires it. Set ALLOW_REAL_API=true to confirm."
             )
 
+
+    def for_fallback(self) -> Settings | None:
+        """The settings the fallback adapter runs with, or None without one.
+
+        Built with dataclasses.replace so __post_init__ runs again: the
+        real-API guard then checks the fallback's host too, not just the
+        primary's.
+        """
+        if not self.fallback_provider:
+            return None
+        return replace(
+            self,
+            provider=self.fallback_provider,
+            model=self.fallback_model or self.model,
+            provider_base_url=(
+                self.provider_base_url if self.fallback_base_url is None
+                else self.fallback_base_url
+            ),
+            fallback_provider="",
+        )
 
     @property
     def targets_real_api(self) -> bool:

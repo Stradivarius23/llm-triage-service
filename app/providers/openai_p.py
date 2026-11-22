@@ -234,9 +234,16 @@ class OpenAIProvider:
             )
             return
 
+        # include_usage above is what makes this present; without it the
+        # final chunk carries none and the ledger would settle at zero.
+        usage = (
+            {"input_tokens": final.usage.prompt_tokens,
+             "output_tokens": final.usage.completion_tokens}
+            if final.usage is not None else {}
+        )
         try:
             result = _parse(_text_of(final))
         except Exception as exc:
-            yield StreamEvent(type="error", error=str(exc), transient=False)
+            yield StreamEvent(type="error", error=str(exc), transient=False, **usage)
             return
-        yield StreamEvent(type="done", result=result)
+        yield StreamEvent(type="done", result=result, **usage)
