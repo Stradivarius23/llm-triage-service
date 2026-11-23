@@ -30,6 +30,14 @@ PROVIDERS = ("anthropic", "openai")
 _TRUE = {"1", "true", "yes", "on"}
 
 
+def _targets_real_api(base_url: str) -> bool:
+    """An empty base URL means the SDK default, which is the real API."""
+    if not base_url:
+        return True
+    host = urlparse(base_url).hostname or ""
+    return any(host == real or host.endswith(f".{real}") for real in REAL_API_HOSTS)
+
+
 def _str(key: str, default: str) -> str:
     value = os.environ.get(key)
     return default if value is None or value == "" else value
@@ -157,6 +165,46 @@ class Settings:
                 f"FALLBACK_PROVIDER must be one of {sorted(PROVIDERS)} or empty, "
                 f"got {self.fallback_provider!r}"
             )
+        if (
+            self.fallback_provider
+            and _targets_real_api(self._fallback_base_url)
+            and not self.allow_real_api
+        ):
+            # Checked here as well as through for_fallback(): the service is
+            # built on the first request, and that is too late to find out.
+            where = urlparse(self._fallback_base_url).hostname or "the SDK's default host"
+            raise ValueError(
+                f"FALLBACK_BASE_URL points at {where}, which sends real, billable "
+                "traffic. Set ALLOW_REAL_API=true to confirm."
+            )
+        if (
+            self.fallback_provider
+            and self.fallback_provider != self.provider
+            and not self.fallback_model
+            and _targets_real_api(self._fallback_base_url)
+        ):
+            # The mock answers to any model name; a real vendor does not. Left
+            # to inherit MODEL, the fallback would send a Claude model to OpenAI
+            # and the mistake would surface on the first outage -- the one
+            # moment the fallback was meant to save.
+            raise ValueError(
+                f"FALLBACK_PROVIDER={self.fallback_provider} reaches the real API "
+                f"but FALLBACK_MODEL is not set, so it would be sent MODEL="
+                f"{self.model!r}, a {self.provider} model. Set FALLBACK_MODEL."
+            )
+        if (
+            self.fallback_provider
+            and self.fallback_provider != self.provider
+            and self.fallback_base_url is None
+            and self.targets_real_api
+        ):
+            # Same failure, other half: the mock serves both dialects on one
+            # port, but a real vendor's host serves only its own.
+            raise ValueError(
+                f"FALLBACK_PROVIDER={self.fallback_provider} would inherit "
+                f"PROVIDER_BASE_URL, which is {self.provider}'s real API. "
+                "Set FALLBACK_BASE_URL (empty means the vendor SDK's default)."
+            )
         if self.targets_real_api and not self.allow_real_api:
             # A base URL is a legitimate configuration — it is how the mock is
             # reached. What needs confirming is real, billable traffic, so the
@@ -172,9 +220,9 @@ class Settings:
     def for_fallback(self) -> Settings | None:
         """The settings the fallback adapter runs with, or None without one.
 
-        Built with dataclasses.replace so __post_init__ runs again: the
-        real-API guard then checks the fallback's host too, not just the
-        primary's.
+        Built with dataclasses.replace so __post_init__ runs again on exactly
+        the settings the adapter will use, rather than on a hand-kept copy of
+        the rules.
         """
         if not self.fallback_provider:
             return None
@@ -182,20 +230,20 @@ class Settings:
             self,
             provider=self.fallback_provider,
             model=self.fallback_model or self.model,
-            provider_base_url=(
-                self.provider_base_url if self.fallback_base_url is None
-                else self.fallback_base_url
-            ),
+            provider_base_url=self._fallback_base_url,
             fallback_provider="",
         )
 
     @property
+    def _fallback_base_url(self) -> str:
+        """Unset inherits the primary's; set-but-empty is the SDK default."""
+        if self.fallback_base_url is None:
+            return self.provider_base_url
+        return self.fallback_base_url
+
+    @property
     def targets_real_api(self) -> bool:
-        """An empty base URL means the SDK default, which is the real API."""
-        if not self.provider_base_url:
-            return True  # no base URL -> SDK default -> the real API
-        host = urlparse(self.provider_base_url).hostname or ""
-        return any(host == real or host.endswith(f".{real}") for real in REAL_API_HOSTS)
+        return _targets_real_api(self.provider_base_url)
 
 
 @lru_cache(maxsize=1)
